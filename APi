@@ -1,0 +1,185 @@
+"""
+FastAPI Backend for Speech Annotation Pipeline
+Endpoints:
+  POST /annotate        – upload audio, returns JSON annotations
+  GET  /health          – health check
+  GET  /docs            – Swagger UI (auto)
+"""
+
+import os
+import uuid
+import tempfile
+import logging
+from pathlib import Path
+from typing import List
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from pipeline import get_pipeline, to_json, to_csv, to_abab_text, AnnotationSegment
+
+logger = logging.getLogger(__name__)
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Speech Annotation API",
+    description="Automated ABAB-style speech annotation using WhisperX + pyannote",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "speech_annotation"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+
+# ── Response models ───────────────────────────────────────────────────────────
+class SegmentOut(BaseModel):
+    speaker: str
+    start: float
+    end: float
+    start_fmt: str
+    end_fmt: str
+    text: str
+
+
+class AnnotationResponse(BaseModel):
+    job_id: str
+    audio_filename: str
+    duration_seconds: float
+    segment_count: int
+    segments: List[SegmentOut]
+    abab_text: str
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _validate_audio(filename: str):
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {ALLOWED_EXTENSIONS}",
+        )
+
+
+def _seg_to_out(s: AnnotationSegment) -> SegmentOut:
+    return SegmentOut(
+        speaker=s.speaker,
+        start=round(s.start, 3),
+        end=round(s.end, 3),
+        start_fmt=s.start_fmt,
+        end_fmt=s.end_fmt,
+        text=s.text,
+    )
+
+
+def _cleanup(path: Path):
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok", "device": "cuda" if __import__("torch").cuda.is_available() else "cpu"}
+
+
+@app.post("/annotate", response_model=AnnotationResponse)
+async def annotate(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """Upload an audio file and receive structured speaker annotations."""
+    _validate_audio(file.filename)
+
+    job_id = str(uuid.uuid4())[:8]
+    suffix = Path(file.filename).suffix.lower()
+    tmp_path = UPLOAD_DIR / f"{job_id}{suffix}"
+
+    # Save upload
+    contents = await file.read()
+    tmp_path.write_bytes(contents)
+    background_tasks.add_task(_cleanup, tmp_path)
+
+    # Run pipeline
+    try:
+        pipeline = get_pipeline()
+        segments = pipeline.process(str(tmp_path))
+    except EnvironmentError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Pipeline error")
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
+
+    if not segments:
+        raise HTTPException(status_code=422, detail="No speech detected in the audio file.")
+
+    duration = segments[-1].end if segments else 0.0
+
+    return AnnotationResponse(
+        job_id=job_id,
+        audio_filename=file.filename,
+        duration_seconds=round(duration, 2),
+        segment_count=len(segments),
+        segments=[_seg_to_out(s) for s in segments],
+        abab_text=to_abab_text(segments),
+    )
+
+
+@app.post("/annotate/export")
+async def annotate_and_export(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    format: str = "json",        # "json" or "csv"
+):
+    """Upload audio and download the annotation file directly."""
+    _validate_audio(file.filename)
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
+
+    job_id = str(uuid.uuid4())[:8]
+    suffix = Path(file.filename).suffix.lower()
+    tmp_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    out_ext = f".{format}"
+    out_path = UPLOAD_DIR / f"{job_id}_result{out_ext}"
+
+    contents = await file.read()
+    tmp_path.write_bytes(contents)
+    background_tasks.add_task(_cleanup, tmp_path)
+    background_tasks.add_task(_cleanup, out_path)
+
+    try:
+        pipeline = get_pipeline()
+        segments = pipeline.process(str(tmp_path))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if format == "json":
+        to_json(segments, str(out_path))
+        media_type = "application/json"
+    else:
+        to_csv(segments, str(out_path))
+        media_type = "text/csv"
+
+    return FileResponse(
+        path=str(out_path),
+        media_type=media_type,
+        filename=f"annotation_{job_id}{out_ext}",
+    )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
