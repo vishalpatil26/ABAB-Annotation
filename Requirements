@@ -1,0 +1,23 @@
+# ── Core ML ───────────────────────────────────────────────────────────────────
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# WhisperX (transcription + alignment)
+whisperx>=3.1.1
+
+# pyannote (diarization + VAD)
+pyannote.audio>=3.1.1
+
+# ── API ───────────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9      # required for FastAPI file uploads
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+gradio>=4.26.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pydantic>=2.0.0
+numpy>=1.24.0
+soundfile>=0.12.1
+librosa>=0.10.1
