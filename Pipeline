@@ -1,0 +1,206 @@
+"""
+Speech Annotation Pipeline
+- Voice Activity Detection (VAD) via pyannote
+- Speaker Diarization via pyannote.audio
+- Transcription via WhisperX
+- Combines into structured ABAB-style annotations
+"""
+
+import os
+import json
+import csv
+import time
+import logging
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+
+import torch
+import whisperx
+from pyannote.audio import Pipeline as PyannotePipeline
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")          # Required for pyannote models
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")   # base / small / medium / large-v2
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+@dataclass
+class AnnotationSegment:
+    speaker: str          # A, B, C …
+    start: float          # seconds
+    end: float            # seconds
+    text: str
+
+    @property
+    def start_fmt(self) -> str:
+        m, s = divmod(int(self.start), 60)
+        return f"{m:02d}:{s:02d}"
+
+    @property
+    def end_fmt(self) -> str:
+        m, s = divmod(int(self.end), 60)
+        return f"{m:02d}:{s:02d}"
+
+    def to_abab(self) -> str:
+        return f"{self.speaker} {self.start_fmt} {self.text}"
+
+
+# ── Label mapper ──────────────────────────────────────────────────────────────
+def _build_speaker_map(raw_labels: List[str]) -> dict:
+    """Map pyannote speaker IDs (SPEAKER_00, …) to A, B, C, …"""
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    seen, mapping = [], {}
+    for lbl in raw_labels:
+        if lbl not in seen:
+            seen.append(lbl)
+    for i, lbl in enumerate(seen):
+        mapping[lbl] = letters[i] if i < len(letters) else f"SPK{i}"
+    return mapping
+
+
+# ── Core pipeline ─────────────────────────────────────────────────────────────
+class SpeechAnnotationPipeline:
+    def __init__(self):
+        self._whisper_model = None
+        self._diarization_pipeline = None
+
+    # --- lazy loaders ---
+    def _load_whisper(self):
+        if self._whisper_model is None:
+            logger.info(f"Loading WhisperX model '{WHISPER_MODEL}' on {DEVICE} …")
+            self._whisper_model = whisperx.load_model(
+                WHISPER_MODEL, DEVICE, compute_type=COMPUTE_TYPE
+            )
+        return self._whisper_model
+
+    def _load_diarization(self):
+        if self._diarization_pipeline is None:
+            if not HF_TOKEN:
+                raise EnvironmentError(
+                    "HF_TOKEN environment variable is required for pyannote diarization. "
+                    "Get a token at https://huggingface.co/settings/tokens and accept the "
+                    "model licence at https://hf.co/pyannote/speaker-diarization-3.1"
+                )
+            logger.info("Loading pyannote diarization pipeline …")
+            self._diarization_pipeline = PyannotePipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=HF_TOKEN,
+            )
+            if DEVICE == "cuda":
+                self._diarization_pipeline = self._diarization_pipeline.to(torch.device("cuda"))
+        return self._diarization_pipeline
+
+    # --- steps ---
+    def _transcribe(self, audio_path: str) -> dict:
+        logger.info("Step 1/3 – Transcribing with WhisperX …")
+        model = self._load_whisper()
+        audio = whisperx.load_audio(audio_path)
+        result = model.transcribe(audio, batch_size=16)
+
+        logger.info("Step 1b – Aligning word timestamps …")
+        align_model, metadata = whisperx.load_align_model(
+            language_code=result["language"], device=DEVICE
+        )
+        result = whisperx.align(
+            result["segments"], align_model, metadata, audio, DEVICE,
+            return_char_alignments=False,
+        )
+        return result
+
+    def _diarize(self, audio_path: str) -> list:
+        logger.info("Step 2/3 – Speaker diarization …")
+        pipeline = self._load_diarization()
+        diarization = pipeline(audio_path)
+        segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+        return segments
+
+    def _assign_speakers(self, transcript_segments: list, diarization_segments: list) -> List[AnnotationSegment]:
+        """Assign speaker labels to transcript segments using maximum-overlap rule."""
+        logger.info("Step 3/3 – Merging transcription + diarization …")
+
+        raw_labels = [d["speaker"] for d in diarization_segments]
+        speaker_map = _build_speaker_map(raw_labels)
+
+        results = []
+        for seg in transcript_segments:
+            t_start, t_end = seg["start"], seg["end"]
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+
+            # Find diarization segment with max overlap
+            best_speaker, best_overlap = "A", 0.0
+            for d in diarization_segments:
+                overlap = max(0, min(t_end, d["end"]) - max(t_start, d["start"]))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = d["speaker"]
+
+            results.append(AnnotationSegment(
+                speaker=speaker_map.get(best_speaker, best_speaker),
+                start=t_start,
+                end=t_end,
+                text=text,
+            ))
+        return results
+
+    # --- public API ---
+    def process(self, audio_path: str) -> List[AnnotationSegment]:
+        t0 = time.time()
+        audio_path = str(Path(audio_path).resolve())
+
+        transcript = self._transcribe(audio_path)
+        diarization = self._diarize(audio_path)
+        annotations = self._assign_speakers(transcript["segments"], diarization)
+
+        elapsed = time.time() - t0
+        logger.info(f"Done in {elapsed:.1f}s – {len(annotations)} segments")
+        return annotations
+
+
+# ── Export helpers ─────────────────────────────────────────────────────────────
+def to_json(segments: List[AnnotationSegment], path: str):
+    data = [
+        {
+            "speaker": s.speaker,
+            "start": round(s.start, 3),
+            "end": round(s.end, 3),
+            "start_fmt": s.start_fmt,
+            "end_fmt": s.end_fmt,
+            "text": s.text,
+        }
+        for s in segments
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def to_csv(segments: List[AnnotationSegment], path: str):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["speaker", "start", "end", "text"])
+        for s in segments:
+            writer.writerow([s.speaker, s.start_fmt, s.end_fmt, s.text])
+
+
+def to_abab_text(segments: List[AnnotationSegment]) -> str:
+    return "\n".join(s.to_abab() for s in segments)
+
+
+# ── Singleton instance ─────────────────────────────────────────────────────────
+_pipeline_instance: Optional[SpeechAnnotationPipeline] = None
+
+
+def get_pipeline() -> SpeechAnnotationPipeline:
+    global _pipeline_instance
+    if _pipeline_instance is None:
+        _pipeline_instance = SpeechAnnotationPipeline()
+    return _pipeline_instance
